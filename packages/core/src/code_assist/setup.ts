@@ -4,9 +4,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { ClientMetadata, OnboardUserRequest } from './types.js';
+import {
+  ClientMetadata,
+  LoadCodeAssistResponse,
+  OnboardUserRequest,
+} from './types.js';
 import { CodeAssistServer } from './server.js';
 import { OAuth2Client } from 'google-auth-library';
+
+export class ProjectIdRequiredError extends Error {
+  constructor() {
+    super(
+      'This account requires settings the GOOGLE_CLOUD_PROJECT env var. See https://goo.gle/gemini-cli-auth-docs#workspace-gca',
+    );
+  }
+}
 
 /**
  *
@@ -14,7 +26,7 @@ import { OAuth2Client } from 'google-auth-library';
  * @returns the user's actual project id
  */
 export async function setupUser(authClient: OAuth2Client): Promise<string> {
-  const projectId = process.env.GOOGLE_CLOUD_PROJECT;
+  let projectId = process.env.GOOGLE_CLOUD_PROJECT;
   const caServer = new CodeAssistServer(authClient, projectId);
 
   const clientMetadata: ClientMetadata = {
@@ -30,28 +42,36 @@ export async function setupUser(authClient: OAuth2Client): Promise<string> {
     metadata: clientMetadata,
   });
 
-  const onboardTier: string =
-    loadRes.allowedTiers?.find((tier) => tier.isDefault)?.id ?? 'legacy-tier';
+  if (!projectId && loadRes.cloudaicompanionProject) {
+    projectId = loadRes.cloudaicompanionProject;
+  }
+  if (!projectId || projectId === '') {
+    throw new ProjectIdRequiredError();
+  }
 
   const onboardReq: OnboardUserRequest = {
-    tierId: onboardTier,
-    cloudaicompanionProject: loadRes.cloudaicompanionProject || projectId || '',
+    tierId: getOnboardTier(loadRes),
+    cloudaicompanionProject: projectId,
     metadata: clientMetadata,
   };
-  try {
-    // Poll onboardUser until long running operation is complete.
-    let lroRes = await caServer.onboardUser(onboardReq);
-    while (!lroRes.done) {
-      await new Promise((f) => setTimeout(f, 5000));
-      lroRes = await caServer.onboardUser(onboardReq);
-    }
-    return lroRes.response?.cloudaicompanionProject?.id || '';
-  } catch (e) {
-    console.log(
-      '\n\nError onboarding with Code Assist.\n' +
-        'Google Workspace Account (e.g. your-name@your-company.com)' +
-        ' must specify a GOOGLE_CLOUD_PROJECT environment variable.\n\n',
-    );
-    throw e;
+
+  // Poll onboardUser until long running operation is complete.
+  let lroRes = await caServer.onboardUser(onboardReq);
+  while (!lroRes.done) {
+    await new Promise((f) => setTimeout(f, 5000));
+    lroRes = await caServer.onboardUser(onboardReq);
   }
+  return projectId;
+}
+
+function getOnboardTier(res: LoadCodeAssistResponse): string {
+  if (res.currentTier) {
+    return res.currentTier.id;
+  }
+  for (const tier of res.allowedTiers || []) {
+    if (tier.isDefault) {
+      return tier.id;
+    }
+  }
+  return 'standard-tier';
 }
